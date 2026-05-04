@@ -12,8 +12,10 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
-BOT_TOKEN = "8309349967:AAHONG8wJ69hjXuOc8XZ11vOpR9zL-UpsXg"
-ADMIN_ID = 959173540
+import os
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 logging.basicConfig(level=logging.INFO)
 
