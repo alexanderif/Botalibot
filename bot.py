@@ -3,7 +3,8 @@ import logging
 import os
 import threading
 from flask import Flask
-import libsql_experimental as libsql
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -16,10 +17,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 # ── env vars ──────────────────────────────────────────────
-BOT_TOKEN   = os.getenv("BOT_TOKEN")
-ADMIN_ID    = int(os.getenv("ADMIN_ID"))
-TURSO_URL   = os.getenv("TURSO_URL")    # libsql://xxx.turso.io
-TURSO_TOKEN = os.getenv("TURSO_TOKEN")  # eyJ...
+BOT_TOKEN  = os.getenv("BOT_TOKEN")
+ADMIN_ID   = int(os.getenv("ADMIN_ID"))
+DB_URL     = os.getenv("DB_URL")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -33,9 +33,9 @@ flask_app = Flask(__name__)
 def home():
     return "Bot is running!", 200
 
-# ── Turso connection ──────────────────────────────────────
+# ── DB connection ─────────────────────────────────────────
 def get_conn():
-    return libsql.connect(TURSO_URL, auth_token=TURSO_TOKEN)
+    return psycopg2.connect(DB_URL, sslmode="require")
 
 # ── States ────────────────────────────────────────────────
 class AdminStates(StatesGroup):
@@ -51,29 +51,30 @@ class AdminStates(StatesGroup):
 # ── DB init ───────────────────────────────────────────────
 def init_db():
     conn = get_conn()
-    conn.execute("""
+    c = conn.cursor()
+    c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
+            id BIGINT PRIMARY KEY,
             balance INTEGER DEFAULT 0
         )
     """)
-    conn.execute("""
+    c.execute("""
         CREATE TABLE IF NOT EXISTS configs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             link TEXT,
             sub_link TEXT DEFAULT '',
             status TEXT DEFAULT 'free'
         )
     """)
-    conn.execute("""
+    c.execute("""
         CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             file_id TEXT,
             status TEXT DEFAULT 'pending'
         )
     """)
-    conn.execute("""
+    c.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -88,8 +89,8 @@ def init_db():
         ("support_id",    ""),
     ]
     for key, val in defaults:
-        conn.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING",
             (key, val)
         )
     conn.commit()
@@ -98,138 +99,156 @@ def init_db():
 # ── DB helpers ────────────────────────────────────────────
 def get_setting(key: str) -> str:
     conn = get_conn()
-    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key = %s", (key,))
+    row = c.fetchone()
     conn.close()
     return row[0] if row else ""
 
 def set_setting(key: str, value: str):
     conn = get_conn()
-    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = %s",
+        (key, value, value)
+    )
     conn.commit()
     conn.close()
 
 def get_user(user_id: int):
     conn = get_conn()
-    row = conn.execute("SELECT id, balance FROM users WHERE id = ?", (user_id,)).fetchone()
+    c = conn.cursor()
+    c.execute("SELECT id, balance FROM users WHERE id = %s", (user_id,))
+    row = c.fetchone()
     conn.close()
     return row
 
 def register_user(user_id: int):
     conn = get_conn()
-    conn.execute("INSERT OR IGNORE INTO users (id, balance) VALUES (?, 0)", (user_id,))
+    c = conn.cursor()
+    c.execute("INSERT INTO users (id, balance) VALUES (%s, 0) ON CONFLICT (id) DO NOTHING", (user_id,))
     conn.commit()
     conn.close()
 
 def get_balance(user_id: int) -> int:
     conn = get_conn()
-    row = conn.execute("SELECT balance FROM users WHERE id = ?", (user_id,)).fetchone()
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE id = %s", (user_id,))
+    row = c.fetchone()
     conn.close()
     return row[0] if row else 0
 
 def update_balance(user_id: int, amount: int):
     conn = get_conn()
-    conn.execute("UPDATE users SET balance = balance + ? WHERE id = ?", (amount, user_id))
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance + %s WHERE id = %s", (amount, user_id))
     conn.commit()
     conn.close()
 
 def set_balance_db(user_id: int, amount: int):
     conn = get_conn()
-    conn.execute("UPDATE users SET balance = ? WHERE id = ?", (amount, user_id))
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = %s WHERE id = %s", (amount, user_id))
     conn.commit()
     conn.close()
 
 def get_all_users():
     conn = get_conn()
-    rows = conn.execute("SELECT id, balance FROM users ORDER BY balance DESC").fetchall()
+    c = conn.cursor()
+    c.execute("SELECT id, balance FROM users ORDER BY balance DESC")
+    rows = c.fetchall()
     conn.close()
     return rows
 
 def delete_user(user_id: int):
     conn = get_conn()
-    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    c = conn.cursor()
+    c.execute("DELETE FROM users WHERE id = %s", (user_id,))
     conn.commit()
     conn.close()
 
 def save_payment(user_id: int, file_id: str) -> int:
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO payments (user_id, file_id, status) VALUES (?, ?, 'pending')",
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO payments (user_id, file_id, status) VALUES (%s, %s, 'pending') RETURNING id",
         (user_id, file_id)
     )
+    payment_id = c.fetchone()[0]
     conn.commit()
-    row = conn.execute("SELECT last_insert_rowid()").fetchone()
     conn.close()
-    return row[0]
+    return payment_id
 
 def update_payment_status(payment_id: int, status: str):
     conn = get_conn()
-    conn.execute("UPDATE payments SET status = ? WHERE id = ?", (status, payment_id))
+    c = conn.cursor()
+    c.execute("UPDATE payments SET status = %s WHERE id = %s", (status, payment_id))
     conn.commit()
     conn.close()
 
 def get_payment(payment_id: int):
     conn = get_conn()
-    row = conn.execute(
-        "SELECT id, user_id, file_id, status FROM payments WHERE id = ?", (payment_id,)
-    ).fetchone()
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, file_id, status FROM payments WHERE id = %s", (payment_id,))
+    row = c.fetchone()
     conn.close()
     return row
 
 def get_pending_payments():
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, user_id, status FROM payments WHERE status = 'pending'"
-    ).fetchall()
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, status FROM payments WHERE status = 'pending'")
+    rows = c.fetchall()
     conn.close()
     return rows
 
 def get_free_config():
     conn = get_conn()
-    row = conn.execute(
-        "SELECT id, link, sub_link FROM configs WHERE status = 'free' LIMIT 1"
-    ).fetchone()
+    c = conn.cursor()
+    c.execute("SELECT id, link, sub_link FROM configs WHERE status = 'free' LIMIT 1")
+    row = c.fetchone()
     conn.close()
     return row
 
 def get_configs_by_status(status: str):
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT id, link, sub_link, status FROM configs WHERE status = ? ORDER BY id DESC",
-        (status,)
-    ).fetchall()
+    c = conn.cursor()
+    c.execute("SELECT id, link, sub_link, status FROM configs WHERE status = %s ORDER BY id DESC", (status,))
+    rows = c.fetchall()
     conn.close()
     return rows
 
 def mark_config_used(config_id: int):
     conn = get_conn()
-    conn.execute("UPDATE configs SET status = 'used' WHERE id = ?", (config_id,))
+    c = conn.cursor()
+    c.execute("UPDATE configs SET status = 'used' WHERE id = %s", (config_id,))
     conn.commit()
     conn.close()
 
 def add_config_db(link: str, sub_link: str):
     conn = get_conn()
-    conn.execute(
-        "INSERT INTO configs (link, sub_link, status) VALUES (?, ?, 'free')",
-        (link, sub_link)
-    )
+    c = conn.cursor()
+    c.execute("INSERT INTO configs (link, sub_link, status) VALUES (%s, %s, 'free')", (link, sub_link))
     conn.commit()
     conn.close()
 
 def delete_config(config_id: int) -> bool:
     conn = get_conn()
-    conn.execute("DELETE FROM configs WHERE id = ?", (config_id,))
+    c = conn.cursor()
+    c.execute("DELETE FROM configs WHERE id = %s", (config_id,))
+    affected = c.rowcount
     conn.commit()
-    row = conn.execute("SELECT changes()").fetchone()
     conn.close()
-    return (row[0] > 0) if row else False
+    return affected > 0
 
 def get_stats():
     conn = get_conn()
-    total_users       = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    free_configs      = conn.execute("SELECT COUNT(*) FROM configs WHERE status='free'").fetchone()[0]
-    used_configs      = conn.execute("SELECT COUNT(*) FROM configs WHERE status='used'").fetchone()[0]
-    pending_payments  = conn.execute("SELECT COUNT(*) FROM payments WHERE status='pending'").fetchone()[0]
-    approved_payments = conn.execute("SELECT COUNT(*) FROM payments WHERE status='approved'").fetchone()[0]
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users"); total_users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM configs WHERE status='free'"); free_configs = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM configs WHERE status='used'"); used_configs = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM payments WHERE status='pending'"); pending_payments = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM payments WHERE status='approved'"); approved_payments = c.fetchone()[0]
     conn.close()
     return total_users, free_configs, used_configs, pending_payments, approved_payments
 
@@ -377,8 +396,7 @@ async def process_config_link(message: Message, state: FSMContext):
     await state.update_data(config_link=message.text.strip())
     await message.answer(
         "✅ لینک کانفیگ ذخیره شد.\n\nحالا لینک سابسکریپشن را ارسال کنید:\n"
-        "مثال:\n`http://193.5.44.32:2096/sub/a4a7pev2dgyhrdoo`\n\n"
-        "اگر ندارید عدد `0` بزنید.",
+        "مثال:\n`http://193.5.44.32:2096/sub/xxx`\n\nاگر ندارید عدد `0` بزنید.",
         parse_mode="Markdown"
     )
     await state.set_state(AdminStates.waiting_sub_link)
@@ -652,7 +670,7 @@ async def set_balance_cmd(message: Message):
             await message.answer("❌ کاربر پیدا نشد."); return
         set_balance_db(uid, amount)
         await message.answer(f"✅ موجودی کاربر `{uid}` به *{amount:,}* تومان تنظیم شد.", parse_mode="Markdown")
-        await bot.send_message(uid, f"💰 موجودی شما توسط مدیریت به *{amount:,}* تومان تنظیم شد.", parse_mode="Markdown")
+        await bot.send_message(uid, f"💰 موجودی شما به *{amount:,}* تومان تنظیم شد.", parse_mode="Markdown")
     except ValueError:
         await message.answer("❌ مقادیر وارد شده معتبر نیستند.")
 
@@ -684,7 +702,7 @@ async def delete_user_cmd(message: Message):
     try:
         uid = int(parts[1])
         delete_user(uid)
-        await message.answer(f"✅ کاربر `{uid}` از پایگاه داده حذف شد.", parse_mode="Markdown")
+        await message.answer(f"✅ کاربر `{uid}` حذف شد.", parse_mode="Markdown")
     except ValueError:
         await message.answer("❌ شناسه باید عدد باشد.")
 
@@ -859,10 +877,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
-
-
